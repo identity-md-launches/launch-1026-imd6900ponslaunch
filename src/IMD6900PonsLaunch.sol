@@ -23,7 +23,8 @@ interface IERC20Supply {
 ///             no snipe tax). It refuses if the coin wouldn't land at the address the owner mined for.
 ///         The coin it buys backs a 1:1 swap for Robinhood's old IMDSTR ({claim}), as the Robinhood → Pons plan has it:
 ///         IMDSTR in, the coin out, never the other way unless the owner opens {redeem} (taxed). What the IMDSTR in
-///         existence can't claim is the owner's to {release}: it can never reach coin an IMDSTR holder could claim.
+///         supply ceiling can't claim is the owner's to {release}. The owner must include all bridgeable supply in
+///         that ceiling; the opening buy may still need additional coin to back every potential claim.
 ///         IMDSTR moves only to and from Robinhood distributors, so claiming opens once the Robinhood timelock makes
 ///         this contract one.
 ///
@@ -32,7 +33,7 @@ interface IERC20Supply {
 ///         hook pay theirs in with {addFees}. {harvest} (anyone) pulls Pons' fees and splits all the ETH here to the
 ///         payees: the pot bridge (ETH to Ethereum's NFT pot, where it buys identity.md machines for the swarm), the
 ///         perps pool, ops. Otherwise, after the launch, ETH leaves only through the Robinhood timelock
-///         ({recoverEth}): never straight to the owner.
+///         ({recoverEth}). The owner controls the split's payees and can hand future Pons fees to a successor.
 contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
     IPonsFactory public immutable factory;
     /// @notice Robinhood's IMDSTR, the old token that swaps 1:1 for the coin
@@ -42,7 +43,7 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
     address public immutable timelock;
 
     /// @notice The brand as it launched on Ethereum: Identity.MD 6900, IMD6900. {meta} launches with these until
-    ///         the owner sets other details ({setMeta}); the creator fees go to the owner by default.
+    ///         the owner sets other details ({setMeta}); the creator fees always go to this distributor.
     string public constant NAME = "Identity.MD 6900";
     string public constant SYMBOL = "IMD6900";
     string public constant LOGO = "https://imd6900.pages.dev/logo.png";
@@ -82,6 +83,14 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
     uint16[8] internal _shares;
     uint8 internal _payeeCount;
 
+    /// @notice Unpaid split shares, including payees removed from the current split
+    mapping(address => uint256) public pendingEth;
+    uint256 public totalPendingEth;
+
+    /// @notice Owner-pinned global IMDSTR ceiling in token base units, including supply that can bridge in.
+    ///         Frozen at launch. Zero disables releases; it is not a zero-supply assumption.
+    uint256 public claimSupplyCeiling;
+
     bool public redeemOpen;
     /// @notice Taken off a {redeem}: the toll on the road home to Ethereum (IMDSTR bridges, the coin doesn't)
     uint16 public redeemTaxBps = 6_900;
@@ -107,6 +116,8 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
     event PayeesSet(address[] payees, uint16[] shares);
     event HandedOff(address newRecipient);
     event EthRecovered(address to, uint256 amount);
+    event ClaimSupplyCeilingSet(uint256 supply);
+    event Paid(address indexed payee, uint256 amount);
 
     error AlreadyLaunched();
     error NotLaunched();
@@ -122,6 +133,9 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
     error Reserved();
     error BadPayees();
     error NotTimelock();
+    error OwnershipRequired();
+    error ExpectedTokenRequired();
+    error EconomicsNotPinned();
 
     /// @dev Writes nothing but the owner and three addresses (no strings: their storage slots would sit in the
     ///      creation code as raw data, which reads as instructions to a code scan)
@@ -167,10 +181,26 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
             return (to, bps);
         }
         (to, bps) = (new address[](n), new uint16[](n));
-        for (uint256 i; i < n; ++i) (to[i], bps[i]) = (_payees[i], _shares[i]);
+        for (uint256 i; i < n; ++i) {
+            (to[i], bps[i]) = (_payees[i], _shares[i]);
+        }
     }
 
     /*                                 OWNER                                */
+
+    /// @notice The default ops payee is the owner, so ownership cannot be renounced to the zero address.
+    function renounceOwnership() public payable override onlyOwner {
+        revert OwnershipRequired();
+    }
+
+    /// @notice Pins the maximum global IMDSTR supply before launch. Include Ethereum and in-flight bridge supply,
+    ///         not just Robinhood's current totalSupply. Leaving this unset disables both kinds of token release.
+    function setClaimSupplyCeiling(uint256 supply) external onlyOwner {
+        if (pons != address(0)) revert AlreadyLaunched();
+        if (supply == 0 || supply < IERC20Supply(imdstr).totalSupply()) revert Reserved();
+        claimSupplyCeiling = supply;
+        emit ClaimSupplyCeilingSet(supply);
+    }
 
     /// @notice Sends ETH held here to `to` (all of it with 0): the way out of a launch the team decides against.
     ///         Before the launch only: after it, the ETH here is the coin's fees and leaves through {split}, or
@@ -202,8 +232,8 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
 
     /// @notice Launches the coin and buys first with `buyEth` of the ETH held here (all of it with 0, the ETH sent
     ///         with this call included); any ETH left over goes back to the owner, so what comes here afterwards is
-    ///         fees only. Reverts unless the coin lands at `expectedToken` (zero: anywhere), so a salt mined for other
-    ///         details can never launch a coin at the wrong address.
+    ///         fees only. Reverts unless the coin lands at the nonzero `expectedToken`. The owner must first store
+    ///         a reviewed, nonzero expectedEconomics digest using {setMeta}.
     /// @param minTokensOut the opening buy's floor
     function launch(bytes32 salt, address expectedToken, uint256 buyEth, uint256 minTokensOut)
         external
@@ -213,13 +243,14 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
         returns (address token, uint256 bought)
     {
         if (pons != address(0)) revert AlreadyLaunched();
+        if (expectedToken == address(0)) revert ExpectedTokenRequired();
         PonsTokenParams memory p = meta(); // the creator fees to this contract, buyback off
         p.salt = salt;
-        if (p.expectedEconomics == bytes32(0)) p.expectedEconomics = factory.previewLaunchEconomics(launchConfigId, address(0));
+        if (p.expectedEconomics == bytes32(0)) revert EconomicsNotPinned();
         uint256 fee = factory.launchFee();
         address curve_;
         (token, curve_) = factory.launchToken{value: fee}(p, launchConfigId, address(0));
-        if (expectedToken != address(0) && token != expectedToken) revert NotWhereMined(token);
+        if (token != expectedToken) revert NotWhereMined(token);
         (pons, curve) = (token, curve_);
 
         uint256 spend = buyEth == 0 ? address(this).balance : buyEth;
@@ -258,6 +289,7 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
 
     /// @notice Sends ETH held here to `to` (all of it with 0), at any time: the escape hatch for the fees after the
     ///         launch (a payee that refused its share, a split the team wants to stop), behind the timelock's delay.
+    ///         Unpaid split credits remain owed; later fees replenish any credits this recovery leaves unfunded.
     function recoverEth(address to, uint256 amount) external nonReentrant {
         if (msg.sender != timelock) revert NotTimelock();
         if (amount == 0) amount = address(this).balance;
@@ -268,37 +300,71 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
 
     /*                         THE FEE DISTRIBUTOR                         */
 
-    /// @notice Books the coin's pending fees into Pons' escrow and claims this contract's ETH from it. Before
-    ///         graduation the curve holds them; after, the meme hook, for `graduatedPoolId` (the graduated pool's id;
-    ///         ignored before). A sweep that can't run doesn't stop the claim. Anyone.
+    /// @notice Attempts to book pending fees, then claims this contract's ETH from Pons' escrow. Before graduation
+    ///         the curve holds them; after, the meme hook, for `graduatedPoolId` (ignored before). Token-denominated
+    ///         pool fees require Pons' sweep operator to convert them with a nonzero minimum first. A failed sweep
+    ///         emits SweepFailed and does not stop claiming ETH already credited to escrow. Anyone.
     function collect(bytes32 graduatedPoolId) public nonReentrant returns (uint256 got) {
         address c = curve;
         if (c == address(0)) revert NotLaunched();
         if (!IPonsCurve(c).graduated()) {
-            try IPonsCurve(c).sweepFees(0) {} catch (bytes memory reason) { emit SweepFailed(reason); }
+            try IPonsCurve(c).sweepFees(0) {}
+            catch (bytes memory reason) {
+                emit SweepFailed(reason);
+            }
         } else if (graduatedPoolId != bytes32(0)) {
             try IPonsMemeHook(factory.memeHook()).sweepPoolFees(graduatedPoolId, 0, 0) {}
-            catch (bytes memory reason) { emit SweepFailed(reason); }
+            catch (bytes memory reason) {
+                emit SweepFailed(reason);
+            }
         }
         IPonsFeeEscrow escrow = IPonsFeeEscrow(factory.feeEscrow());
         if (escrow.balanceOf(address(this)) != 0) got = escrow.claim();
         emit Collected(got);
     }
 
-    /// @notice Pays all the ETH here to the payees, pro rata. After the launch only (before it, the ETH is the opening
-    ///         buy's). A payee that refuses its share leaves it here for the next split. Anyone.
+    /// @notice Allocates new ETH pro rata and retries the current payees' unpaid shares. Refused shares stay assigned
+    ///         to their payee, including after setPayees or an ownership transfer. Returns newly allocated ETH (before
+    ///         rounding); rounding dust waits for the next split. After launch only. Anyone.
     function split() public nonReentrant returns (uint256 amount) {
         if (pons == address(0)) revert NotLaunched();
-        amount = address(this).balance;
-        if (amount == 0) return 0;
+        uint256 held = address(this).balance;
+        amount = held > totalPendingEth ? held - totalPendingEth : 0;
         (address[] memory to, uint16[] memory bps) = payees();
+        // Assign every share before making any external call.
         for (uint256 i; i < to.length; ++i) {
             uint256 part = (amount * bps[i]) / 10_000;
-            if (part == 0) continue;
-            (bool ok,) = to[i].call{value: part}("");
-            if (!ok) emit PayFailed(to[i], part);
+            pendingEth[to[i]] += part;
+            totalPendingEth += part;
+        }
+        for (uint256 i; i < to.length; ++i) {
+            _pay(to[i]);
         }
         emit Split(amount);
+    }
+
+    /// @notice Retries only this payee's assigned split share, even after it was removed. Anyone may retry;
+    ///         payment can only go to the original payee. This is the same split payout path, not an owner withdrawal.
+    function split(address payee) external nonReentrant returns (uint256 paid) {
+        if (pons == address(0)) revert NotLaunched();
+        return _pay(payee);
+    }
+
+    function _pay(address payee) internal returns (uint256 paid) {
+        paid = pendingEth[payee];
+        // The timelock may have recovered ETH backing these credits.
+        if (paid > address(this).balance) paid = address(this).balance;
+        if (paid == 0 || payee == address(0)) return 0;
+        pendingEth[payee] -= paid;
+        totalPendingEth -= paid;
+        (bool ok,) = payee.call{value: paid}("");
+        if (!ok) {
+            pendingEth[payee] += paid;
+            totalPendingEth += paid;
+            emit PayFailed(payee, paid);
+            return 0;
+        }
+        emit Paid(payee, paid);
     }
 
     /// @notice {collect} then {split}: Pons' fees to the pot, the perps pool and ops in one call. Anyone.
@@ -307,12 +373,23 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
         return split();
     }
 
-    /// @notice The coin beyond what all the IMDSTR outside this contract could claim: the owner's
+    /// @notice Coin beyond the global ceiling less IMDSTR held here. No releases without a pinned ceiling.
     function releasable() public view returns (uint256) {
-        if (pons == address(0)) return 0;
+        if (pons == address(0) || claimSupplyCeiling == 0) return 0;
         uint256 held = SafeTransferLib.balanceOf(pons, address(this));
-        uint256 owed = IERC20Supply(imdstr).totalSupply() - SafeTransferLib.balanceOf(imdstr, address(this));
+        uint256 owed = claimReserve();
         return held > owed ? held - owed : 0;
+    }
+
+    /// @notice Required claim inventory under the pinned ceiling (or current Robinhood supply if greater).
+    ///         Returns uint256.max while the global ceiling is unset, keeping releases disabled.
+    function claimReserve() public view returns (uint256) {
+        uint256 supply = claimSupplyCeiling;
+        if (supply == 0) return type(uint256).max;
+        uint256 localSupply = IERC20Supply(imdstr).totalSupply();
+        if (localSupply > supply) supply = localSupply;
+        uint256 held = SafeTransferLib.balanceOf(imdstr, address(this));
+        return supply > held ? supply - held : 0;
     }
 
     /// @notice Sends `amount` of the coin no IMDSTR holder can claim (all of it with 0) to `to`: the perps pool's seed,
@@ -326,7 +403,12 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
     }
 
     /// @notice Sells `amount` of the releasable coin into its curve and sends the ETH to `to`
-    function releaseAsEth(uint256 amount, uint256 minEthOut, address to) external onlyOwner nonReentrant returns (uint256 out) {
+    function releaseAsEth(uint256 amount, uint256 minEthOut, address to)
+        external
+        onlyOwner
+        nonReentrant
+        returns (uint256 out)
+    {
         uint256 free = releasable();
         if (amount == 0) amount = free;
         if (amount == 0 || amount > free) revert Reserved();
@@ -336,14 +418,16 @@ contract IMD6900PonsLaunch is Ownable, ReentrancyGuard {
         emit Released(to, amount);
     }
 
-    /// @notice Sends the IMDSTR collected by claims to `to` (all of it with 0) while {redeem} is closed: on Ethereum it
-    ///         is IMD6900 again. Claims never need it (they pay out the coin), only {redeem} does.
+    /// @notice Sends claimed IMDSTR to `to` (all with 0) while redeem is closed, only if the coin remaining here
+    ///         also backs the claim rights that sending this IMDSTR out restores. Requires a pinned global ceiling.
     function releaseImdstr(uint256 amount, address to) external onlyOwner nonReentrant {
         if (redeemOpen) revert RedeemIsOpen();
+        if (pons == address(0) || claimSupplyCeiling == 0) revert Reserved();
         uint256 held = SafeTransferLib.balanceOf(imdstr, address(this));
         if (amount == 0) amount = held;
         if (amount == 0 || amount > held) revert Reserved();
         SafeTransferLib.safeTransfer(imdstr, to, amount);
+        if (SafeTransferLib.balanceOf(pons, address(this)) < claimReserve()) revert Reserved();
         emit ImdstrReleased(to, amount);
     }
 

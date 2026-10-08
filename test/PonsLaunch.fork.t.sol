@@ -22,6 +22,12 @@ interface ICurveBuy {
     function buy(uint256 quoteIn, uint256 minTokensOut, address recipient) external payable returns (uint256);
 }
 
+interface IHookPolicyAdmin {
+    function owner() external view returns (address);
+    function protocolFeeShareBps() external view returns (uint256);
+    function setProtocolFeeShareBps(uint256 bps) external;
+}
+
 /// @notice On a Robinhood Chain fork, against Pons itself: the launch contract as the swarm deploys it, the team's ETH
 ///         sent in, the vanity salt mined for it, the launch at the mined address with the opening buy, the 1:1
 ///         claim once the Robinhood timelock makes it a distributor, the release of what no holder can claim, and the
@@ -40,6 +46,10 @@ contract PonsLaunchForkTest is Test {
         if (bytes(rpc_).length == 0) vm.skip(true);
         vm.createSelectFork(rpc_);
         l = new IMD6900PonsLaunch(TEAM, FACTORY, IMDSTR, TIMELOCK);
+        PonsTokenParams memory m = l.meta();
+        m.expectedEconomics = l.factory().previewLaunchEconomics(l.launchConfigId(), address(0));
+        vm.prank(TEAM);
+        l.setMeta(m);
         vm.deal(TEAM, 5 ether);
     }
 
@@ -101,17 +111,16 @@ contract PonsLaunchForkTest is Test {
         assertEq(IERC20Meta(IMDSTR).balanceOf(address(l)), 1_000_000e18, "kept here");
     }
 
-    function test_fork_ReleaseWhatNoHolderCanClaim() public {
+    function test_fork_NoReleaseWithoutGlobalSupplyCeiling() public {
         (address token, uint256 bought) = _launch(2 ether);
         uint256 supply = IERC20Meta(IMDSTR).totalSupply();
         emit log_named_decimal_uint("IMDSTR on Robinhood (millions)", supply / 1e6, 18);
-        uint256 free = l.releasable();
-        assertEq(free, bought > supply ? bought - supply : 0, "everything beyond one coin per IMDSTR");
-        if (free == 0) return;
+        // Robinhood supply alone is not a safe reserve for this OFT. No guessed Ethereum ceiling in this test.
+        assertEq(l.releasable(), 0);
         vm.prank(TEAM);
+        vm.expectRevert(IMD6900PonsLaunch.Reserved.selector);
         l.release(0, TEAM);
-        assertEq(IERC20Meta(token).balanceOf(TEAM), free);
-        assertEq(IERC20Meta(token).balanceOf(address(l)), supply, "one coin for every IMDSTR there is");
+        assertEq(IERC20Meta(token).balanceOf(address(l)), bought, "all inventory retained");
     }
 
     /// @dev The coin's creator fees, Pons' own escrow and all: a trade, then anyone harvests, 70% to the pot bridge
@@ -167,5 +176,24 @@ contract PonsLaunchForkTest is Test {
         vm.prank(TEAM);
         vm.expectRevert(); // NotWhereMined: the old salt lands the new details somewhere else
         l.launch(oldSalt, before, 0, 0);
+    }
+
+    function test_fork_ChangedFeePolicyRejectsPreviouslyPinnedEconomics() public {
+        _fund(1 ether);
+        (bool found, bytes32 salt, address predicted,) = PonsPredict.mine(l, bytes("69"), 0, 5_000);
+        assertTrue(found);
+        bytes32 pinned = l.meta().expectedEconomics;
+        IHookPolicyAdmin hook = IHookPolicyAdmin(l.factory().memeHook());
+        uint256 oldShare = hook.protocolFeeShareBps();
+        address admin = hook.owner();
+        vm.prank(admin);
+        hook.setProtocolFeeShareBps(oldShare == 0 ? 1 : oldShare - 1);
+        bytes32 changed = l.factory().previewLaunchEconomics(l.launchConfigId(), address(0));
+        assertTrue(changed != pinned);
+        vm.prank(TEAM);
+        vm.expectRevert(abi.encodeWithSignature("LaunchEconomicsMismatch(bytes32,bytes32)", pinned, changed));
+        l.launch(salt, predicted, 0, 0);
+        assertEq(l.pons(), address(0));
+        assertEq(address(l).balance, 1 ether);
     }
 }

@@ -28,7 +28,8 @@ struct PonsTokenParams {
     address creatorFeeRecipient;
     uint16 creatorTaxBps;
     bool buybackEnabled;
-    /// @dev previewLaunchEconomics(configId, pairToken): the launch reverts if Pons moved its terms since
+    /// @dev Store the reviewed previewLaunchEconomics(configId, pairToken) digest before launching.
+    ///      This adapter requires a nonzero pin; Pons reverts if its terms no longer match.
     bytes32 expectedEconomics;
     /// @dev CREATE2 salt for the curve and the coin: mined for a vanity coin address
     bytes32 salt;

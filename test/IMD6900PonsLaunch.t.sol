@@ -110,13 +110,23 @@ contract MockFactory {
         recipientOf[token] = to;
     }
 
-    function previewLaunchEconomics(uint256, address) external pure returns (bytes32) {
-        return keccak256("economics");
+    bytes32 public economics = keccak256("economics");
+
+    function setEconomics(bytes32 value) external {
+        economics = value;
     }
 
-    function launchToken(PonsTokenParams calldata p, uint256, address) external payable returns (address token, address curve) {
+    function previewLaunchEconomics(uint256, address) external view returns (bytes32) {
+        return economics;
+    }
+
+    function launchToken(PonsTokenParams calldata p, uint256, address)
+        external
+        payable
+        returns (address token, address curve)
+    {
         require(msg.value == launchFee, "fee");
-        require(p.expectedEconomics == keccak256("economics"), "economics");
+        require(p.expectedEconomics == economics, "economics");
         last = p;
         MockToken t = new MockToken{salt: p.salt}();
         MockCurve c = new MockCurve(t, feeEscrow, p.creatorFeeRecipient);
@@ -125,14 +135,22 @@ contract MockFactory {
     }
 
     function predict(bytes32 salt) external view returns (address) {
-        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(type(MockToken).creationCode))))));
+        return address(
+            uint160(
+                uint256(
+                    keccak256(
+                        abi.encodePacked(bytes1(0xff), address(this), salt, keccak256(type(MockToken).creationCode))
+                    )
+                )
+            )
+        );
     }
 }
 
 /// @notice The launch contract offline: it deploys where nothing it names exists (IMD's fresh-chain run), passes IMD's
 ///         admission scan and limits, holds the team's ETH and gives it back, and launches, claims, releases and
 ///         redeems as it should (against a stand-in Pons; test/PonsLaunch.fork.t.sol runs the real one).
-contract IMD6900PonsLaunchTest is Test {
+abstract contract LaunchFixture is Test {
     address constant OWNER = 0x35dA9C0303507ddf708E87F2568EdDf12c47a059;
     address constant PONS_FACTORY = 0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e;
     address constant IMDSTR = 0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F;
@@ -151,9 +169,32 @@ contract IMD6900PonsLaunchTest is Test {
         imdstr.mint(holder, 10_000_000e18);
         imdstr.mint(makeAddr("everyone else"), 90_000_000e18); // 100M IMDSTR in all
         l = new IMD6900PonsLaunch(OWNER, address(factory), address(imdstr), TIMELOCK);
+        // This mock represents a closed 100M global supply. Production must include bridgeable supply too.
+        vm.prank(OWNER);
+        l.setClaimSupplyCeiling(100_000_000e18);
+        _pinEconomics();
         vm.deal(OWNER, 10 ether);
     }
 
+    function _pinEconomics() internal {
+        PonsTokenParams memory m = l.meta();
+        m.expectedEconomics = factory.previewLaunchEconomics(l.launchConfigId(), address(0));
+        vm.prank(OWNER);
+        l.setMeta(m);
+    }
+
+    function _launch(uint256 eth) internal returns (address token) {
+        vm.prank(OWNER);
+        (bool ok,) = address(l).call{value: eth}("");
+        assertTrue(ok);
+        bytes32 salt = keccak256("mined");
+        address expected = factory.predict(salt);
+        vm.prank(OWNER);
+        (token,) = l.launch(salt, expected, 0, 0);
+    }
+}
+
+contract IMD6900PonsLaunchTest is LaunchFixture {
     /* ── IMD's admission ─────────────────────────────────────────── */
 
     function test_DeploysOnAFreshChain() public {
@@ -179,8 +220,10 @@ contract IMD6900PonsLaunchTest is Test {
     }
 
     function test_FitsOneTransaction() public {
-        bytes memory init = abi.encodePacked(type(IMD6900PonsLaunch).creationCode, abi.encode(OWNER, PONS_FACTORY, IMDSTR, TIMELOCK));
+        bytes memory init =
+            abi.encodePacked(type(IMD6900PonsLaunch).creationCode, abi.encode(OWNER, PONS_FACTORY, IMDSTR, TIMELOCK));
         assertLt(init.length, INITCODE_CAP, "initcode");
+        assertLe(address(l).code.length, 24_576, "runtime exceeds EIP-170");
         uint256 g = gasleft();
         new IMD6900PonsLaunch(OWNER, PONS_FACTORY, IMDSTR, TIMELOCK);
         uint256 used = g - gasleft() + 53_000 + 40 * init.length;
@@ -267,16 +310,6 @@ contract IMD6900PonsLaunchTest is Test {
 
     /* ── the launch ──────────────────────────────────────────────── */
 
-    function _launch(uint256 eth) internal returns (address token) {
-        vm.prank(OWNER);
-        (bool ok,) = address(l).call{value: eth}("");
-        assertTrue(ok);
-        bytes32 salt = keccak256("mined");
-        address expected = factory.predict(salt);
-        vm.prank(OWNER);
-        (token,) = l.launch(salt, expected, 0, 0);
-    }
-
     function test_LaunchBuysFirstWithAllTheEth() public {
         address token = _launch(2 ether);
         assertEq(l.pons(), token);
@@ -310,15 +343,17 @@ contract IMD6900PonsLaunchTest is Test {
         vm.expectRevert(Ownable.Unauthorized.selector);
         l.launch(bytes32(0), address(0), 0, 0);
         vm.deal(address(l), 0.0005 ether); // only the fee: nothing to buy with
+        address expected = factory.predict(bytes32(0));
         vm.prank(OWNER);
         vm.expectRevert(IMD6900PonsLaunch.NoEth.selector);
-        l.launch(bytes32(0), address(0), 0, 0);
+        l.launch(bytes32(0), expected, 0, 0);
     }
 
     function test_LaunchWithTheEthSentAlong_partOfIt_theRestBackToTheOwner() public {
         uint256 before = OWNER.balance;
+        address expected = factory.predict(keccak256("s"));
         vm.prank(OWNER);
-        l.launch{value: 1 ether}(keccak256("s"), address(0), 0.5 ether, 0);
+        l.launch{value: 1 ether}(keccak256("s"), expected, 0.5 ether, 0);
         assertEq(l.launchEth(), 0.5 ether);
         assertEq(address(l).balance, 0, "what isn't spent goes back: after the launch only fees come here");
         assertEq(before - OWNER.balance, 0.5 ether + 0.0005 ether);

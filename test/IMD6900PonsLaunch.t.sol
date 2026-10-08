@@ -163,7 +163,7 @@ abstract contract LaunchFixture is Test {
     IMD6900PonsLaunch l;
     address holder = makeAddr("an IMDSTR holder");
 
-    function setUp() public {
+    function setUp() public virtual {
         factory = new MockFactory();
         imdstr = new MockToken();
         imdstr.mint(holder, 10_000_000e18);

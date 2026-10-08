@@ -13,6 +13,9 @@ optimizer = true
 optimizer_runs = 200
 via_ir = true
 evm_version = "cancun"
+# the vanity miner (test/MineVanity.t.sol) asks Pons for ~65k addresses on average for 0x6900: far past forge's default
+# gas limit for a test (2^30)
+gas_limit = "18446744073709551615"
 remappings = [
     "solady/=lib/solady/src/",
     "forge-std/=lib/forge-std/src/",

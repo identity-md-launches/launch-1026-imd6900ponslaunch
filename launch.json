@@ -1,0 +1,15 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "IMD6900PonsLaunch",
+      "constructorArgs": [
+        "$owner",
+        "0x7eD598BcEf8bd9Edd8C97A195C6d13f40801EC7e",
+        "0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F",
+        "0x16D3f65B708883DF042d98E1C7a49B32A33E2A14"
+      ]
+    }
+  ],
+  "notes": "Deploy the accepted IMD6900PonsLaunch from src/IMD6900PonsLaunch.sol on Robinhood Chain. Constructor order: owner, Pons V2 launch factory, Robinhood IMDSTR, Robinhood timelock. $owner is the approved team wallet 0x35da9c0303507ddf708e87f2568eddf12c47a059. The nonpayable constructor stores these addresses without external calls. The owner later operates the Pons launch for Identity.MD 6900 (IMD6900); the accepted brand constants, logo, socials and default 590 bps creator tax remain unchanged. Metadata is owner-settable before launch, with creator fees forced to this contract and buyback disabled. The later launch requires pinned economics and the expected vanity address mined for this deployed contract and its final metadata; a different address reverts. Team ETH is withdrawable by the owner before launch; buyEth=0 spends the available balance after Pons' launch fee on the opening buy. Coin inventory backs 1:1 IMDSTR claims once the timelock authorizes this contract as an IMDSTR distributor. Token releases remain disabled until the owner pins the global claim supply ceiling before launch. Pons creator fees and incoming perps fees are distributed through harvest and split. Default payees remain 70% to POT_BRIDGE and 30% to the owner for ops; the owner may set payees. After launch, held ETH leaves through split payouts or timelock-only recoverEth. This manifest deploys only this application contract with zero ETH and specifies no initialization calls."
+}
